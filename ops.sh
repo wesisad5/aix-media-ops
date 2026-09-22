@@ -45,10 +45,29 @@ if ! git clone --filter=blob:none --sparse --depth 1 \
   exit 1
 fi
 cd data
-git sparse-checkout set scripts media_shards.json \
-  download/aixstudio/media_manifest.json src/data/catalog \
-  mini-services/netlify-vault/blob-sync.mjs \
-  mini-services/netlify-vault/package.json 2> >(sed "s|${GH_PAT}|***REDACTED***|g" | tail -1 >&2) || true
+# FIX 2026-09-23: cone-mode sparse-checkout REJECTS file pathspecs ("fatal:
+# 'media_shards.json' is not a directory") — the whole set aborted, the || true
+# swallowed it, and the build ran with ZERO pipeline files (thumbs_rc=2 in 2s).
+# Non-cone patterns accept exact files. rc is captured directly (process
+# substitution preserves $?; the old `|| true` was the real rc-eater) and the
+# build now FAILS LOUDLY if the pipeline files are missing — a silent
+# no-op build burns a remote-build slot and reports a green lie.
+SPARSE_LOG=$(mktemp)
+git sparse-checkout set --no-cone \
+  '/scripts/**' '/media_shards.json' \
+  '/download/aixstudio/media_manifest.json' \
+  '/src/data/catalog/**' \
+  '/mini-services/netlify-vault/blob-sync.mjs' \
+  '/mini-services/netlify-vault/package.json' \
+  2> "$SPARSE_LOG"
+SPARSE_RC=$?
+sed "s|${GH_PAT}|***REDACTED***|g" "$SPARSE_LOG" | tail -2 >&2
+if [ "$SPARSE_RC" != "0" ] || [ ! -f scripts/aix_thumbs_push_ghapi.py ] \
+   || [ ! -f scripts/aix_media_queue.py ]; then
+  say "FATAL: sparse checkout failed (rc=$SPARSE_RC) — pipeline files missing"
+  cd ..
+  exit 1
+fi
 say "sparse checkout done: $(du -sh . 2>/dev/null | cut -f1)"
 cd ..
 
