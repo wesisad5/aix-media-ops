@@ -116,9 +116,10 @@ trap release_locks EXIT
 # the pusher is resumable, so a kill loses at most one 200-item chunk and
 # the status write still happens.
 # A6-P2-4: thumbs-push-lock FIRST — the weekly GHA run pushes to the SAME
-# thumbs repo with the same script; a concurrent ref move between its GET
-# and PATCH 422-crashes one writer. Lock held elsewhere -> defer (rc=3,
-# backlog semantics).
+# Netlify thumbs store; concurrent index writes clobber (round-5 class).
+# Lock held elsewhere -> defer (rc=3, backlog semantics).
+# ROUND-9 CUTOVER: pushes go to the NETLIFY thumbs blob store — the GH
+# thumbs repo is FROZEN and serves only as the route's fallback tier.
 THUMBS_TIME_CAP=$(( BUDGET_S - 300 ))
 THUMBS_RC=0
 THUMBS_NOTE=""
@@ -139,7 +140,9 @@ else
   say "thumbs chunk: max ${THUMBS_MAX_ITEMS} items (cap ${THUMBS_TIME_CAP}s)..."
   set +e
   timeout --signal=TERM --kill-after=20 "$THUMBS_TIME_CAP" \
-    env GH_TOKEN="$THUMBS_PAT" python3 data/scripts/aix_thumbs_push_ghapi.py \
+    env NETLIFY_AUTH_TOKEN="$NETLIFY_AUTH_TOKEN" \
+        THUMBS_SITE_ID=75c01060-e863-4377-bbed-820ce64fafac \
+    python3 data/scripts/aix_thumbs_push_netlify.py \
     --manifest data/download/aixstudio/media_manifest.json \
     --catalog data/src/data/catalog \
     --max-items "$THUMBS_MAX_ITEMS" --chunk 200 --fetch-workers 6
