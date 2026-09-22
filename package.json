@@ -1,0 +1,8 @@
+{
+  "name": "aix-media-ops",
+  "private": true,
+  "description": "Bounded media-sync builds (thumbs + blob chunks) on Netlify free-tier remote builds",
+  "dependencies": {
+    "@netlify/blobs": "^8.2.0"
+  }
+}
