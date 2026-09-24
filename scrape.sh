@@ -56,7 +56,8 @@ chain_media_build() {  # retry x2; echoes final http code
       -H "Authorization: Bearer $NETLIFY_AUTH_TOKEN" \
       -H "Content-Type: application/json" \
       "https://api.netlify.com/api/v1/sites/$OPS_SITE_ID/builds" -d '{}' || echo 000)
-    case "$code" in 2*|429) break ;; esac
+    # V1-P3: 429 is rate-limiting, NOT acceptance — only 2xx breaks
+    case "$code" in 2*) break ;; esac
     [ "$i" = "3" ] || sleep 5
   done
   echo "$code"
@@ -184,28 +185,36 @@ say "suite done rc=$SUITE_RC partial=$PARTIAL ($(left)s left)"
 # --- 6. repair pass (torn JSONL lines / corrupt state files) ----------------
 say "repair pass (torn trailing JSONL lines + state files)..."
 python3 - <<'EOF'
-import glob, json, os
+import glob, json, os, subprocess
 BASE = os.environ["AIX_BASE"]
 fixed = []
 # 1) JSONL: drop a torn trailing line (record re-fetched next run — idempotent)
+# V1-P1 FIX: ALWAYS terminate with \n — the old ternary was provably always
+# false on this path (a properly-\n-terminated file never reaches here), so
+# the repaired file lost its newline, the next append-mode writer
+# concatenated onto the last line, and the mid-file corrupt line crashed
+# finalize forever (invisible to last-line-only repair).
 for p in glob.glob(f"{BASE}/download/aixstudio/**/*.jsonl", recursive=True):
     try:
         with open(p, "rb") as f:
             data = f.read()
         lines = data.split(b"\n")
-        # file ends with \n normally; trailing element b"" is fine
         if lines and lines[-1] != b"":
             try:
                 json.loads(lines[-1])
             except Exception:
                 with open(p, "wb") as f:
-                    f.write(b"\n".join(lines[:-1]) + (b"\n" if data.endswith(b"\n") else b""))
+                    f.write(b"\n".join(lines[:-1]) + b"\n")
                 fixed.append((p, "torn-last-line-dropped"))
     except Exception:
         pass
-# 2) JSON state/profile files: delete-on-corrupt (all are re-buildable:
-#    state = progress cursors (tolerant re-sweep), user_profiles = re-fetch)
+# 2) JSON files: repair-by-git-restore (V1-P2: the good copy is in the
+#    clone; restoring beats deleting — finalize needs user_profiles.json
+#    THIS run, and aux_public2.json is read unguarded by build_catalog).
+#    State files get the same treatment (last committed cursor = safe
+#    idempotent re-sweep). Never-committed files fall back to delete.
 for p in [f"{BASE}/download/aixstudio/user_profiles.json",
+          f"{BASE}/download/aixstudio/aux_public2.json",
           f"{BASE}/scripts/aix_state.json", f"{BASE}/scripts/aix_prism_state.json",
           f"{BASE}/scripts/aix_auth_state.json",
           f"{BASE}/scripts/aix_lib_detail_state.json"]:
@@ -213,8 +222,14 @@ for p in [f"{BASE}/download/aixstudio/user_profiles.json",
         try:
             json.load(open(p))
         except Exception:
-            os.remove(p)
-            fixed.append((p, "corrupt-json-deleted"))
+            rel = os.path.relpath(p, BASE)
+            r = subprocess.run(["git", "-C", BASE, "checkout", "--", rel],
+                               capture_output=True)
+            if r.returncode == 0:
+                fixed.append((p, "corrupt-json-git-restored"))
+            else:
+                os.remove(p)
+                fixed.append((p, "corrupt-json-deleted (uncommitted)"))
 for p, why in fixed:
     print(f"  repaired: {os.path.basename(p)} ({why})")
 print(f"repair pass done: {len(fixed)} fixes")
@@ -223,10 +238,9 @@ EOF
 # --- 7. finalize + rebuild catalogs + manifest ------------------------------
 say "finalize + rebuild..."
 set +e
-( cd data && python3 scripts/aix_finalize.py ) && \
-( cd data && python3 scripts/aix_build_catalog.py ) && \
-( cd data && python3 scripts/aix_build_catalog_auth.py ) && \
-( cd data && python3 scripts/aix_media_manifest.py )
+FIN_CAP=$(left)
+( cd data && timeout --signal=TERM --kill-after=15 "$FIN_CAP" sh -c \
+  'python3 scripts/aix_finalize.py && python3 scripts/aix_build_catalog.py && python3 scripts/aix_build_catalog_auth.py && python3 scripts/aix_media_manifest.py' )
 FIN_RC=$?
 set -e
 if [ "$FIN_RC" != "0" ]; then
@@ -235,9 +249,10 @@ if [ "$FIN_RC" != "0" ]; then
 fi
 say "rebuild OK ($(left)s left)"
 
-# --- 8. validate --------------------------------------------------------------
+# --- 8. validate (V1-P3: timeout-wrapped like everything else) ---------------
 set +e
-( cd data && python3 scripts/aix_validate.py )
+VAL_CAP=$(left); [ "$VAL_CAP" -lt 30 ] && VAL_CAP=30
+( cd data && timeout --signal=TERM --kill-after=10 "$VAL_CAP" python3 scripts/aix_validate.py )
 VAL_RC=$?
 set -e
 if [ "$VAL_RC" != "0" ]; then
