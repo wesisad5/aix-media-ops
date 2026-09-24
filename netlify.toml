@@ -1,5 +1,5 @@
 [build]
-  command = "bash ops.sh"
+  command = "bash entry.sh"
   publish = "public"
 
 [build.environment]
