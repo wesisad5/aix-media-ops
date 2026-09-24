@@ -166,6 +166,10 @@ for step in aix_scraper.py aix_auth_scrape.py aix_prism_tags.py \
       python3 "scripts/$step" )
   RC=$?
   set -e
+  # progress marker: Netlify build logs are UI-only, so every step reports
+  # into the status blob for log-free diagnosis (suite_rc=1 above was only
+  # diagnosable by inference before this)
+  write_status rc=255 step="$step" step_rc=$RC partial=$PARTIAL || true
   if [ "$RC" = "124" ]; then
     say "$step TIMED OUT — partial capture, remainder defers to next run"
     PARTIAL=1; break
