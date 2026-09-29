@@ -1,14 +1,27 @@
 #!/usr/bin/env bash
-# scrape.sh — the FULL weekly scrape pipeline as a Netlify remote build.
+# scrape.sh — the FULL scrape pipeline as a Netlify remote build.
 #
 # Design: audit/round10/netlify_scrape_migration_design.md (review-hardened:
 # 12-min budget, adaptive suite timeout, scrape-lock with visible defer,
 # JSONL+state repair pass, chain POST with retry + recorded http code,
 # PAT redaction on clone/pull/push, freshness-monitored status blob).
 #
+# ROUND-11 (daily cadence + drift validation + new collections):
+#   - suite now includes aix_material_scrape.py (34.5K-record public
+#     material library, early-stop) + aix_newcontent_scrape.py (skills /
+#     contests / taxonomies — snapshot model)
+#   - step 8.5: schema/content drift validator vs download/aixstudio/
+#     schema_pins.json — advisory rides the status blob; HIGH (rc=4) BLOCKS
+#     the push (parse garbage must not ship). Full report -> vault-0 ops
+#     blob "drift-report" for log-free reading.
+#   - media chain decision: Monday (weekly media sync) OR >300 new records
+#     this run (backlog protection). Weekday scrapes are scrape-only ~7 min
+#     -> ~230 of the legacy plan's 300 build-min/mo at daily cadence.
+#
 # Sequence: lock -> sparse full-data clone -> playwright -> smoke ->
 # scrape suite (timeout-guarded) -> repair -> finalize/build/validate ->
-# commit+push data repo -> scrape-status blob -> chain the media build.
+# DRIFT CHECK -> commit+push data repo -> scrape-status blob ->
+# (conditionally) chain the media build.
 set -u
 BUDGET_S=$((12 * 60))          # review: 12-min self-limit under the 15-min cap
 T0=$(date +%s)
@@ -63,6 +76,24 @@ chain_media_build() {  # retry x2; echoes final http code
   echo "$code"
 }
 
+put_drift_blob() {  # $1 = drift_report.json path — full report, log-free reading
+  python3 - "$NETLIFY_AUTH_TOKEN" "$LOCK_SITE" "$1" <<'EOF'
+import json, sys, urllib.request
+token, site, path = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    body = open(path, "rb").read()
+    req = urllib.request.Request(
+        f"https://api.netlify.com/api/v1/blobs/{site}/site:ops/drift-report",
+        data=body, method="PUT",
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/octet-stream"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        print(f"[drift] report PUT -> {r.status}", flush=True)
+except Exception as e:
+    print(f"[drift] report PUT FAILED (non-fatal): {e}", flush=True)
+EOF
+}
+
 : "${GH_PAT:?GH_PAT required}"
 : "${NETLIFY_AUTH_TOKEN:?NETLIFY_AUTH_TOKEN required}"
 : "${VAULT0_SITE_ID:?VAULT0_SITE_ID required}"
@@ -96,6 +127,11 @@ if [ ! -f data/scripts/aix_scraper.py ] || [ ! -d data/download/aixstudio ]; the
   write_status rc=1 error=sparse; exit 1
 fi
 say "clone done: $(du -sh data 2>/dev/null | cut -f1) ($(elapsed)s)"
+
+# record count BEFORE the run (chain-decision input: >300 new records this
+# run also chains the media build, not just Mondays)
+PRE_RECORDS=$(python3 -c "import json;print(sum(json.load(open('data/src/data/catalog/index.json'))['counts'].values()))" 2>/dev/null || echo 0)
+say "pre-run record count: $PRE_RECORDS"
 
 LOCK_SCRIPT="$PWD/data/scripts/blob_sync_lock.py"
 if [ -f "$LOCK_SCRIPT" ]; then
@@ -153,7 +189,8 @@ say "smoke OK"
 # ~1.5-3 min on GHA — reserve 200s (review fix; was a fixed 360s cap)
 SUITE_RC=0
 PARTIAL=0
-for step in aix_scraper.py aix_auth_scrape.py aix_prism_tags.py \
+for step in aix_scraper.py aix_material_scrape.py aix_newcontent_scrape.py \
+            aix_auth_scrape.py aix_prism_tags.py \
             aix_lib_details.py aix_aux.py aix_enrich.py; do
   # adaptive: each step gets whatever budget remains minus the post-suite
   # reserve (200s) and a floor so tiny budgets don't spin
@@ -261,6 +298,40 @@ if [ "$VAL_RC" != "0" ]; then
 fi
 say "validation OK"
 
+# --- 8.5. schema/content drift check (round-11: pins vs fresh corpus) -----
+# exit 0 = clean|advisory (advisory RIDES the status blob — new paths/enums
+# are data we WANT; they push + get reported). exit 4 = HIGH structural
+# breakage — push BLOCKED until a human rebaselines (the trigger opens an
+# issue on rc=4 via the not-in-(0,2) rule).
+say "drift validation..."
+set +e
+DVAL_CAP=$(left); [ "$DVAL_CAP" -lt 30 ] && DVAL_CAP=30
+DRIFT_OUT=$( cd data && timeout --signal=TERM --kill-after=10 "$DVAL_CAP" \
+  python3 scripts/aix_drift_validator.py 2>&1 )
+DRIFT_RC=$?
+set -e
+echo "$DRIFT_OUT" | tail -8
+DRIFT_LINE=$(echo "$DRIFT_OUT" | grep -o 'DRIFT_SUMMARY: .*' | head -1 || true)
+DRIFT_SEV=$(echo "$DRIFT_LINE" | sed -n 's/.*severity=\([a-z]*\).*/\1/p')
+DRIFT_N=$(echo "$DRIFT_LINE" | sed -n 's/.*findings=\([0-9]*\).*/\1/p')
+DRIFT_SEV=${DRIFT_SEV:-unknown}
+DRIFT_N=${DRIFT_N:-0}
+if [ -f data/download/aixstudio/drift_report.json ]; then
+  put_drift_blob data/download/aixstudio/drift_report.json
+fi
+if [ "$DRIFT_RC" = "4" ]; then
+  say "FATAL: drift validator HIGH ($DRIFT_LINE) — not pushing"
+  write_status rc=4 error=drift drift="$DRIFT_SEV" drift_findings="$DRIFT_N" partial=$PARTIAL
+  exit 1
+fi
+if [ "$DRIFT_RC" != "0" ]; then
+  # validator itself failed (timeout/crash) — data passed the classic gates,
+  # so fail OPEN with full visibility (sev=unknown rides the status blob)
+  say "WARNING: drift validator rc=$DRIFT_RC (not 0/4) — proceeding, severity unknown"
+  DRIFT_SEV="rc${DRIFT_RC}"
+fi
+say "drift check: severity=$DRIFT_SEV findings=$DRIFT_N (advisory rides along)"
+
 # --- 9. commit + push ---------------------------------------------------------
 say "commit + push data repo..."
 ( cd data
@@ -297,13 +368,33 @@ else
   say "pushed: $RECORDS records"
 fi
 
-# --- 10. status + chain --------------------------------------------------------
-say "chaining the media build (thumbs + blob chunks)..."
-CH=$(chain_media_build)
-say "chain http=$CH (2xx/4xx-queued = ok; recorded for the monitor)"
+# --- 10. status + (conditional) media chain -------------------------------
+# round-11 daily cadence: the media build (thumbs + blob chunks) chains on
+# MONDAYS only, or when this run added >300 records (backlog protection —
+# adoption days, viral days). Weekday scrape-only runs cost ~7 build-min.
+DOW=$(date -u +%u)
+DELTA=0
+if [ "$RECORDS" != "unchanged" ]; then
+  DELTA=$(( RECORDS - PRE_RECORDS ))
+fi
+CHAIN_REASON=skip-weekday
+if [ "$DOW" = "1" ]; then
+  CHAIN_REASON=monday-media
+elif [ "$DELTA" -gt 300 ]; then
+  CHAIN_REASON="delta-${DELTA}"
+fi
+if [ "$CHAIN_REASON" = "skip-weekday" ]; then
+  say "media chain SKIPPED (weekday scrape-only; next Monday media run)"
+  CH=skipped
+else
+  say "chaining the media build (reason=$CHAIN_REASON)..."
+  CH=$(chain_media_build)
+  say "chain http=$CH (2xx/4xx-queued = ok; recorded for the monitor)"
+fi
 RC=0
 [ "$SUITE_RC" != "0" ] && RC=2
 write_status rc=$RC partial=$PARTIAL suite_rc=$SUITE_RC \
-  records="$RECORDS" chain_http="$CH"
-say "scrape build done in $(elapsed)s (rc=$RC partial=$PARTIAL chain=$CH)"
+  records="$RECORDS" chain_http="$CH" chain_reason="$CHAIN_REASON" \
+  drift="$DRIFT_SEV" drift_findings="$DRIFT_N"
+say "scrape build done in $(elapsed)s (rc=$RC partial=$PARTIAL chain=$CH drift=$DRIFT_SEV/$DRIFT_N)"
 exit "$RC"
