@@ -210,11 +210,15 @@ for step in aix_scraper.py aix_material_scrape.py aix_newcontent_scrape.py \
   write_status rc=255 step="$step" step_rc=$RC partial=$PARTIAL || true
   if [ "$RC" = "124" ]; then
     say "$step TIMED OUT — partial capture, remainder defers to next run"
-    PARTIAL=1; break
+    PARTIAL=1; FAILED_STEP="$step(timeout)"; break
   fi
   if [ "$RC" != "0" ] && [ "$RC" != "3" ]; then
     say "$step FAILED rc=$RC — continuing with lighter steps (fail recorded)"
     SUITE_RC=$RC
+    # V1-P2-2: remember WHICH step failed — the final status carries it so a
+    # persistent rc=2 (e.g. expired token killing one step every run) stays
+    # visible in steady-state telemetry instead of reading as "healthy".
+    FAILED_STEP="$step"
   fi
 done
 say "suite done rc=$SUITE_RC partial=$PARTIAL ($(left)s left)"
@@ -334,6 +338,11 @@ say "drift check: severity=$DRIFT_SEV findings=$DRIFT_N (advisory rides along)"
 
 # --- 9. commit + push ---------------------------------------------------------
 say "commit + push data repo..."
+# V1-P1-2 FIX: the subshell below exits non-zero on push failure / rebase
+# conflict / no-changes (42). Under set -e that KILLED the script before
+# PUSH_RC=$? — every graceful path after it (status write, chain decision,
+# RECORDS=unchanged) was dead code. Shield it:
+set +e
 ( cd data
   git config user.name "netlify-ops[bot]"
   git config user.email "netlify-ops[bot]@users.noreply.github.com"
@@ -354,8 +363,9 @@ say "commit + push data repo..."
     exit 1
   fi
   git push origin main 2> >(redact | tail -3 >&2)
-) 
+)
 PUSH_RC=$?
+set -e
 if [ "$PUSH_RC" = "42" ]; then
   say "no data changes this run (clean week)"
   PUSH_RC=0
@@ -374,7 +384,10 @@ fi
 # adoption days, viral days). Weekday scrape-only runs cost ~7 build-min.
 DOW=$(date -u +%u)
 DELTA=0
-if [ "$RECORDS" != "unchanged" ]; then
+# V1-P2-3: only apply the delta rule when PRE_RECORDS is a real count — the
+# `|| echo 0` fallback (missing index.json) must not chain media for the
+# WHOLE catalog on a weekday.
+if [ "$RECORDS" != "unchanged" ] && [ "${PRE_RECORDS:-0}" -gt 0 ] 2>/dev/null; then
   DELTA=$(( RECORDS - PRE_RECORDS ))
 fi
 CHAIN_REASON=skip-weekday
@@ -395,6 +408,6 @@ RC=0
 [ "$SUITE_RC" != "0" ] && RC=2
 write_status rc=$RC partial=$PARTIAL suite_rc=$SUITE_RC \
   records="$RECORDS" chain_http="$CH" chain_reason="$CHAIN_REASON" \
-  drift="$DRIFT_SEV" drift_findings="$DRIFT_N"
+  drift="$DRIFT_SEV" drift_findings="$DRIFT_N" fail_step="${FAILED_STEP:-none}"
 say "scrape build done in $(elapsed)s (rc=$RC partial=$PARTIAL chain=$CH drift=$DRIFT_SEV/$DRIFT_N)"
 exit "$RC"
