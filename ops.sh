@@ -31,7 +31,9 @@ say() { echo "[ops $(elapsed)s] $*"; }
 : "${THUMBS_PAT:?THUMBS_PAT required}"
 : "${NETLIFY_AUTH_TOKEN:?NETLIFY_AUTH_TOKEN required}"
 : "${VAULT0_SITE_ID:?VAULT0_SITE_ID required}"
-THUMBS_MAX_ITEMS="${THUMBS_MAX_ITEMS:-900}"
+# round-12: parallel uploads + sibling-first made the pusher ~8x
+# faster; the 480s time cap binds before 1800 items now.
+THUMBS_MAX_ITEMS="${THUMBS_MAX_ITEMS:-1800}"
 
 say "Netlify media-ops build starting (budget ${BUDGET_S}s)"
 
@@ -145,7 +147,7 @@ else
     python3 data/scripts/aix_thumbs_push_netlify.py \
     --manifest data/download/aixstudio/media_manifest.json \
     --catalog data/src/data/catalog \
-    --max-items "$THUMBS_MAX_ITEMS" --chunk 200 --fetch-workers 6
+    --max-items "$THUMBS_MAX_ITEMS" --chunk 400 --fetch-workers 10 --upload-workers 8
   THUMBS_RC=$?
   [ "$THUMBS_RC" = "124" ] && THUMBS_RC=3   # timeout = backlog remains
   set -e
