@@ -191,7 +191,7 @@ SUITE_RC=0
 PARTIAL=0
 for step in aix_scraper.py aix_material_scrape.py aix_newcontent_scrape.py \
             aix_auth_scrape.py aix_prism_tags.py \
-            aix_lib_details.py aix_aux.py aix_enrich.py; do
+            aix_lib_details.py aix_aux.py aix_enrich.py aix_agent_registry.py; do
   # adaptive: each step gets whatever budget remains minus the post-suite
   # reserve (200s) and a floor so tiny budgets don't spin
   REMAIN=$(( $(left) - 200 ))
